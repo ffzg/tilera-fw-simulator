@@ -439,7 +439,7 @@ if __name__ == "__main__":
     parser.add_argument('--sport', type=int, default=12345, help='Source Port')
     parser.add_argument('--in-iface', help='In Interface (auto-detected if omitted)')
     parser.add_argument('--out-iface', help='Out Interface (auto-detected if omitted)')
-    parser.add_argument('--test-response', action='store_true', help='Test return packet as well')
+    parser.add_argument('--no-response', action='store_true', help='Do not test return packet')
     parser.add_argument('--verbose', action='store_true', help='Show skipped rules')
     parser.add_argument('--rsc', default='backup.rsc', help='Backup RSC file')
     parser.add_argument('--extra-lists', nargs='*', default=['tilera.address-list.2'], help='Extra address list files')
@@ -465,7 +465,7 @@ if __name__ == "__main__":
     
     res, conn = simulate(cfg, conntrack, packet, verbose=args.verbose, label="INITIAL PACKET")
 
-    if args.test_response and conn:
+    if not args.no_response and conn:
         response_packet = {
             'src_ip': packet['dst_ip'], 'src_port': packet['dst_port'],
             'dst_ip': packet['src_ip'], 'dst_port': packet['src_port'],
