@@ -1,3 +1,4 @@
+
 import re
 import ipaddress
 import sys
@@ -176,6 +177,7 @@ class Config:
         self.nat_rules = []
         self.address_lists = {}
         self.interfaces = []
+        self.local_ips = set()
         self.routes = []
         self.parse_rsc(filename)
         if extra_address_lists:
@@ -222,7 +224,13 @@ class Config:
                 addr = params.get('address')
                 iface = params.get('interface')
                 if addr and iface:
-                    self.interfaces.append((ipaddress.ip_network(addr, strict=False), iface))
+                    if '/' in addr:
+                        ip_only = addr.split('/')[0]
+                        self.local_ips.add(ip_only)
+                        self.interfaces.append((ipaddress.ip_network(addr, strict=False), iface))
+                    else:
+                        self.local_ips.add(addr)
+                        self.interfaces.append((ipaddress.ip_network(addr + "/32", strict=False), iface))
 
             elif '/ip route' in full_line:
                 params = parse_params(full_line.split('add ')[1])
@@ -296,6 +304,9 @@ def run_chain(ruleset, chain_name, packet, cfg_rules, verbose=False, depth=0, ta
     print(f"{indent}>>> Table: {table_name}, Chain: {chain_name}")
     
     chain_rules = [r for r in ruleset if r.chain == chain_name]
+    if not chain_rules:
+        print(f"{indent}    (No rules in chain {chain_name})")
+        return 'CONTINUE', None
     
     for i, rule in enumerate(chain_rules):
         matched, reason = rule.matches(packet)
@@ -379,25 +390,37 @@ def simulate(cfg, conntrack, packet, verbose=False, label="PACKET"):
         packet['state'] = 'new'
         print(f"Flow: {packet['src_ip']}:{packet['src_port']} -> {packet['dst_ip']}:{packet['dst_port']} ({packet['proto']}, {packet['state']})")
 
-    packet['out_interface'] = cfg.get_interface(packet['dst_ip'])
+    # Determine Chain: INPUT, OUTPUT, or FORWARD
+    filter_chain = 'forward'
+    if packet['dst_ip'] in cfg.local_ips:
+        filter_chain = 'input'
+    elif packet['src_ip'] in cfg.local_ips or packet['src_ip'] == 'ROUTER_IP':
+        filter_chain = 'output'
+    
     print(f"Interfaces: in:{packet['in_interface']} out:{packet['out_interface']}")
+    print(f"Chain detected: {filter_chain}")
     
     # 1. PREROUTING (DSTNAT)
-    if packet['state'] == 'new':
+    if packet['state'] == 'new' and filter_chain != 'output':
         res, _ = run_chain(cfg.nat_rules, 'dstnat', packet, cfg.rules, verbose, table_name="nat")
         if res == 'DST-NAT':
+            # Re-check chain after DST-NAT
+            if packet['dst_ip'] in cfg.local_ips:
+                filter_chain = 'input'
+            else:
+                filter_chain = 'forward'
             packet['out_interface'] = cfg.get_interface(packet['dst_ip'])
-            print(f"Rerouting after DST-NAT: new out-interface: {packet['out_interface']}")
+            print(f"Rerouting after DST-NAT: new chain: {filter_chain}, new out-interface: {packet['out_interface']}")
     
-    # 2. FILTERING (FORWARD)
-    res, _ = run_chain(cfg.rules, 'forward', packet, cfg.rules, verbose, table_name="filter")
+    # 2. FILTERING
+    res, _ = run_chain(cfg.rules, filter_chain, packet, cfg.rules, verbose, table_name="filter")
     
     if res == 'DROP' or res == 'REJECT':
         print(f"Result: {res}")
         return res, None
 
     # 3. POSTROUTING (SRCNAT)
-    if packet['state'] == 'new':
+    if packet['state'] == 'new' and filter_chain != 'input':
         run_chain(cfg.nat_rules, 'srcnat', packet, cfg.rules, verbose, table_name="nat")
 
     if packet['state'] == 'new' and (res in ['ACCEPT', 'CONTINUE', 'ACCEPT (default)', 'FASTTRACK-CONNECTION']):
@@ -428,7 +451,7 @@ if __name__ == "__main__":
     print("\n[ADDRESS LISTS]")
     for name, addrs in sorted(cfg.address_lists.items()):
         print(f"  {name:20} {len(addrs):>5} entries")
-    
+        
     conntrack = Conntrack()
     
     in_iface = args.in_iface or cfg.get_interface(args.src)
@@ -443,7 +466,6 @@ if __name__ == "__main__":
     res, conn = simulate(cfg, conntrack, packet, verbose=args.verbose, label="INITIAL PACKET")
 
     if args.test_response and conn:
-        # Note: Response source/destination are the NATed state of the initial packet
         response_packet = {
             'src_ip': packet['dst_ip'], 'src_port': packet['dst_port'],
             'dst_ip': packet['src_ip'], 'dst_port': packet['src_port'],
