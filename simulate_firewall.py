@@ -424,6 +424,11 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     cfg = Config(args.rsc, extra_address_lists=args.extra_lists)
+    
+    print("\n[ADDRESS LISTS]")
+    for name, addrs in sorted(cfg.address_lists.items()):
+        print(f"  {name:20} {len(addrs):>5} entries")
+    
     conntrack = Conntrack()
     
     in_iface = args.in_iface or cfg.get_interface(args.src)
