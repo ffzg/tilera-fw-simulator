@@ -85,7 +85,48 @@ class Rule:
             if packet.get('routing_mark') != self.params['routing-mark']:
                 return False, f"routing-mark {packet.get('routing_mark')} mismatch with {self.params['routing-mark']}"
 
+        if 'tcp-flags' in self.params:
+            if packet['proto'] != 'tcp':
+                return False, "tcp-flags on non-TCP protocol"
+            if not self.match_tcp_flags(packet.get('tcp_flags', ''), self.params['tcp-flags']):
+                return False, f"tcp-flags mismatch with {self.params['tcp-flags']}"
+
+        if 'content' in self.params:
+            if self.params['content'] not in packet.get('content', ''):
+                return False, f"content '{self.params['content']}' not found in packet"
+
+        if 'packet-size' in self.params:
+            if not self.match_port(packet.get('size', 0), self.params['packet-size']):
+                return False, f"packet-size {packet.get('size')} mismatch with {self.params['packet-size']}"
+
         return True, "Matched"
+
+    def match_tcp_flags(self, packet_flags, spec):
+        # MikroTik format: [!]flag1,flag2
+        # Special case: tcp-flags="" means match all packets (effectively ignored or matched)
+        # Another case: tcp-flags=!syn (matches if syn bit is NOT set)
+        if spec == "": return True
+        
+        negated = spec.startswith('!')
+        if negated: spec = spec[1:]
+        
+        target_flags = set(spec.split(','))
+        # packet_flags is a string like "syn,ack"
+        p_flags = set(packet_flags.split(',')) if packet_flags else set()
+        
+        # Match logic: ALL target_flags must be present in p_flags? 
+        # Actually MikroTik tcp-flags match if ANY of the specified flags are set?
+        # No, usually it's bitwise AND.
+        # "syn" matches if SYN is set. "!syn" matches if SYN is NOT set.
+        # "syn,ack" matches if BOTH are set.
+        
+        match = True
+        for f in target_flags:
+            if f not in p_flags:
+                match = False
+                break
+        
+        return not match if negated else match
     
     def match_ip(self, ip, spec):
         negated = spec.startswith('!')
@@ -566,6 +607,9 @@ if __name__ == "__main__":
     parser.add_argument('--sport', type=int, default=12345, help='Source Port (for tcp/udp) or ICMP code (for icmp)')
     parser.add_argument('--in-iface', help='In Interface (auto-detected if omitted)')
     parser.add_argument('--out-iface', help='Out Interface (auto-detected if omitted)')
+    parser.add_argument('--tcp-flags', default='', help='TCP flags (e.g. syn,ack)')
+    parser.add_argument('--content', default='', help='Packet content to match')
+    parser.add_argument('--size', type=int, default=0, help='Packet size')
     parser.add_argument('--no-response', action='store_true', help='Do not test return packet')
     parser.add_argument('--verbose', action='store_true', help='Show skipped rules')
     parser.add_argument('--rsc', default='backup.rsc', help='Backup RSC file')
@@ -586,7 +630,8 @@ if __name__ == "__main__":
     out_iface = args.out_iface or cfg.get_interface(args.dst)
     packet = {
         'src_ip': args.src, 'dst_ip': args.dst,
-        'proto': args.proto, 'in_interface': in_iface, 'out_interface': out_iface
+        'proto': args.proto, 'in_interface': in_iface, 'out_interface': out_iface,
+        'tcp_flags': args.tcp_flags, 'content': args.content, 'size': args.size
     }
     if args.proto in ['tcp', 'udp']:
         packet['src_port'] = args.sport
