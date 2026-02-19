@@ -155,47 +155,35 @@ def parse_params(line):
 
 class Conntrack:
     def __init__(self):
-        self.table = [] # List of connection objects
+        self.table = {} # (src, sport, dst, dport, proto) -> (conn, direction)
     
     def lookup(self, packet):
-        for conn in self.table:
-            # Check forward direction
-            if (str(packet['src_ip']) == conn['orig_src_ip'] and
-                packet['src_port'] == conn['orig_src_port'] and
-                str(packet['dst_ip']) == conn['orig_dst_ip'] and
-                packet['dst_port'] == conn['orig_dst_port'] and
-                packet['proto'] == conn['proto']):
-                return conn, 'forward'
-            
-            # Check reply direction (matched against NATed state of original packet)
-            reply_src_ip = conn['nat_dst_ip'] or conn['orig_dst_ip']
-            reply_src_port = conn['nat_dst_port'] or conn['orig_dst_port']
-            reply_dst_ip = conn['nat_src_ip'] or conn['orig_src_ip']
-            reply_dst_port = conn['nat_src_port'] or conn['orig_src_port']
-            
-            if (str(packet['src_ip']) == reply_src_ip and
-                packet['src_port'] == reply_src_port and
-                str(packet['dst_ip']) == reply_dst_ip and
-                packet['dst_port'] == reply_dst_port and
-                packet['proto'] == conn['proto']):
-                return conn, 'reply'
-        
-        return None, None
+        key = (str(packet['src_ip']), packet.get('src_port'), str(packet['dst_ip']), packet.get('dst_port'), packet['proto'])
+        return self.table.get(key, (None, None))
     
-    def establish(self, orig_packet, nat_packet):
+    def establish(self, orig, nat):
         conn = {
-            'orig_src_ip': str(orig_packet['src_ip']),
-            'orig_src_port': orig_packet['src_port'],
-            'orig_dst_ip': str(orig_packet['dst_ip']),
-            'orig_dst_port': orig_packet['dst_port'],
-            'nat_src_ip': str(nat_packet['src_ip']) if str(nat_packet['src_ip']) != str(orig_packet['src_ip']) else None,
-            'nat_src_port': nat_packet['src_port'] if nat_packet['src_port'] != orig_packet['src_port'] else None,
-            'nat_dst_ip': str(nat_packet['dst_ip']) if str(nat_packet['dst_ip']) != str(orig_packet['dst_ip']) else None,
-            'nat_dst_port': nat_packet['dst_port'] if nat_packet['dst_port'] != orig_packet['dst_port'] else None,
-            'proto': orig_packet['proto']
+            'orig_src_ip': str(orig['src_ip']), 'orig_src_port': orig.get('src_port'),
+            'orig_dst_ip': str(orig['dst_ip']), 'orig_dst_port': orig.get('dst_port'),
+            'nat_src_ip': str(nat['src_ip']) if str(nat['src_ip']) != str(orig['src_ip']) else None,
+            'nat_src_port': nat.get('src_port') if nat.get('src_port') != orig.get('src_port') else None,
+            'nat_dst_ip': str(nat['dst_ip']) if str(nat['dst_ip']) != str(orig['dst_ip']) else None,
+            'nat_dst_port': nat.get('dst_port') if nat.get('dst_port') != orig.get('dst_port') else None,
+            'proto': orig['proto']
         }
-        self.table.append(conn)
+        
+        fwd_key = (conn['orig_src_ip'], conn['orig_src_port'], conn['orig_dst_ip'], conn['orig_dst_port'], conn['proto'])
+        self.table[fwd_key] = (conn, 'forward')
+        
+        reply_src_ip = conn['nat_dst_ip'] or conn['orig_dst_ip']
+        reply_src_port = conn['nat_dst_port'] or conn['orig_dst_port']
+        reply_dst_ip = conn['nat_src_ip'] or conn['orig_src_ip']
+        reply_dst_port = conn['nat_src_port'] or conn['orig_src_port']
+        reply_key = (reply_src_ip, reply_src_port, reply_dst_ip, reply_dst_port, conn['proto'])
+        self.table[reply_key] = (conn, 'reply')
+        
         return conn
+
 
 class Config:
     def __init__(self, filename, extra_address_lists=None):
@@ -235,15 +223,14 @@ class Config:
                 full_line = context + " " + line
             
             if not full_line: continue
+
             if '/ip firewall address-list' in full_line:
                 params = parse_params(full_line.split('add ')[1])
                 name = params.get('list')
                 addr = params.get('address')
                 if name and addr:
-                    if name not in self.address_lists:
-                        self.address_lists[name] = []
-                    if addr not in self.address_lists[name]:
-                        self.address_lists[name].append(addr)
+                    self.address_lists.setdefault(name, []).append(addr)
+
             elif '/ip address' in full_line:
                 params = parse_params(full_line.split('add ')[1])
                 addr = params.get('address')
@@ -254,33 +241,26 @@ class Config:
                     self.interface_ips[iface] = ip_only
                     net = ipaddress.ip_network(addr, strict=False) if '/' in addr else ipaddress.ip_network(addr + "/32", strict=False)
                     self.interfaces.append((net, iface))
+
             elif '/ip route' in full_line:
                 params = parse_params(full_line.split('add ')[1])
                 dst = params.get('dst-address', '0.0.0.0/0')
                 gw = params.get('gateway')
                 if dst and gw:
                     self.routes.append((ipaddress.ip_network(dst, strict=False), gw))
-        for i, line in enumerate(lines):
-            line = line.strip()
-            if not line or line.startswith('#'): continue
-            full_line = ""
-            if line.startswith('/'):
-                context = line
-                if ' add ' in line: full_line = line
-            elif line.startswith('add'):
-                full_line = context + " " + line
-            
-            if not full_line: continue
-            if '/ip firewall filter' in full_line:
+
+            elif '/ip firewall filter' in full_line:
                 params = parse_params(full_line.split('add ')[1])
                 chain = params.get('chain')
                 action = params.get('action', 'accept')
                 self.rules.append(Rule(i + 1, chain, action, params, full_line, self.address_lists))
+
             elif '/ip firewall nat' in full_line:
                 params = parse_params(full_line.split('add ')[1])
                 chain = params.get('chain')
                 action = params.get('action', 'accept')
                 self.nat_rules.append(Rule(i + 1, chain, action, params, full_line, self.address_lists))
+
     
     def parse_extra_address_list(self, filename):
         with open(filename, 'r') as f:
