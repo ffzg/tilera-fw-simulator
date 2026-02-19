@@ -72,6 +72,19 @@ class Rule:
         if 'out-interface' in self.params:
             if packet['out_interface'] != self.params['out-interface']:
                 return False, f"out-interface {packet['out_interface']} mismatch with {self.params['out-interface']}"
+        
+        if 'packet-mark' in self.params:
+            if packet.get('packet_mark') != self.params['packet-mark']:
+                return False, f"packet-mark {packet.get('packet_mark')} mismatch with {self.params['packet-mark']}"
+        
+        if 'connection-mark' in self.params:
+            if packet.get('connection_mark') != self.params['connection-mark']:
+                return False, f"connection-mark {packet.get('connection_mark')} mismatch with {self.params['connection-mark']}"
+        
+        if 'routing-mark' in self.params:
+            if packet.get('routing_mark') != self.params['routing-mark']:
+                return False, f"routing-mark {packet.get('routing_mark')} mismatch with {self.params['routing-mark']}"
+
         return True, "Matched"
     
     def match_ip(self, ip, spec):
@@ -190,6 +203,8 @@ class Config:
         self.rules = []  # filter rules (v4)
         self.ipv6_rules = [] # filter rules (v6)
         self.nat_rules = [] # nat rules (v4)
+        self.mangle_rules = [] # mangle rules (v4)
+        self.ipv6_mangle_rules = [] # mangle rules (v6)
         self.address_lists = {} # v4 lists
         self.ipv6_address_lists = {} # v6 lists
         self.interfaces = [] # v4 networks
@@ -298,6 +313,18 @@ class Config:
                 chain = params.get('chain')
                 action = params.get('action', 'accept')
                 self.nat_rules.append(Rule(i + 1, chain, action, params, full_line, self.address_lists))
+
+            elif '/ip firewall mangle' in full_line:
+                params = parse_params(full_line.split('add ')[1])
+                chain = params.get('chain')
+                action = params.get('action', 'accept')
+                self.mangle_rules.append(Rule(i + 1, chain, action, params, full_line, self.address_lists))
+
+            elif '/ipv6 firewall mangle' in full_line:
+                params = parse_params(full_line.split('add ')[1])
+                chain = params.get('chain')
+                action = params.get('action', 'accept')
+                self.ipv6_mangle_rules.append(Rule(i + 1, chain, action, params, full_line, self.ipv6_address_lists))
 
     
     def parse_extra_address_list(self, filename):
@@ -415,6 +442,25 @@ def run_chain(ruleset, chain_name, packet, cfg_rules, verbose=False, depth=0, ta
                     return 'REDIRECT', True
                 else:
                     return 'CONTINUE', None
+            
+            elif rule.action == 'mark-packet':
+                packet['packet_mark'] = rule.params.get('new-packet-mark')
+                print(f"{indent} MANGLE (mark-packet): new-packet-mark={packet['packet_mark']}")
+                if rule.params.get('passthrough') == 'no':
+                    return 'CONTINUE_STOP', None
+            
+            elif rule.action == 'mark-routing':
+                packet['routing_mark'] = rule.params.get('new-routing-mark')
+                print(f"{indent} MANGLE (mark-routing): new-routing-mark={packet['routing_mark']}")
+                if rule.params.get('passthrough') == 'no':
+                    return 'CONTINUE_STOP', None
+            
+            elif rule.action == 'mark-connection':
+                packet['connection_mark'] = rule.params.get('new-connection-mark')
+                print(f"{indent} MANGLE (mark-connection): new-connection-mark={packet['connection_mark']}")
+                if rule.params.get('passthrough') == 'no':
+                    return 'CONTINUE_STOP', None
+
         elif verbose:
             print(f"{indent} [SKIP] L{rule.line_no}: {reason}")
     
@@ -428,8 +474,9 @@ def simulate(cfg, conntrack, packet, verbose=False, label="PACKET"):
     is_v6 = ipaddress.ip_address(packet['src_ip']).version == 6
     local_ips = cfg.ipv6_local_ips if is_v6 else cfg.local_ips
     ruleset = cfg.ipv6_rules if is_v6 else cfg.rules
+    mangle_ruleset = cfg.ipv6_mangle_rules if is_v6 else cfg.mangle_rules
     
-    # Determine Chain: INPUT, OUTPUT, or FORWARD
+    # Determine initial chain
     filter_chain = 'forward'
     if packet['dst_ip'] in local_ips:
         filter_chain = 'input'
@@ -467,26 +514,39 @@ def simulate(cfg, conntrack, packet, verbose=False, label="PACKET"):
         packet['state'] = 'new'
         print(f"Flow: {packet['src_ip']}:{packet['src_port']} -> {packet['dst_ip']}:{packet['dst_port']} ({packet['proto']}, {packet['state']})")
     
-    # 1. PREROUTING (DSTNAT)
-    if not is_v6 and packet['state'] == 'new' and filter_chain != 'output':
-        res, _ = run_chain(cfg.nat_rules, 'dstnat', packet, cfg.rules, verbose, table_name="nat")
-        if res == 'DST-NAT':
-            # Re-check chain after DST-NAT
-            if packet['dst_ip'] in local_ips:
-                filter_chain = 'input'
-            else:
-                filter_chain = 'forward'
-            packet['out_interface'] = cfg.get_interface(packet['dst_ip'])
-            print(f"Rerouting after DST-NAT: new chain: {filter_chain}, new out-interface: {packet['out_interface']}")
+    # 1. PREROUTING
+    if filter_chain != 'output':
+        # Mangle Prerouting
+        run_chain(mangle_ruleset, 'prerouting', packet, ruleset, verbose, table_name="mangle")
+        
+        # NAT DSTNAT
+        if not is_v6 and packet['state'] == 'new':
+            res, _ = run_chain(cfg.nat_rules, 'dstnat', packet, cfg.rules, verbose, table_name="nat")
+            if res == 'DST-NAT':
+                # Re-check chain after DST-NAT
+                if packet['dst_ip'] in local_ips:
+                    filter_chain = 'input'
+                else:
+                    filter_chain = 'forward'
+                packet['out_interface'] = cfg.get_interface(packet['dst_ip'])
+                print(f"Rerouting after DST-NAT: new chain: {filter_chain}, new out-interface: {packet['out_interface']}")
     
-    # 2. FILTERING
+    # 2. FILTERING AND MANGLE (INPUT / FORWARD / OUTPUT)
+    # Mangle
+    run_chain(mangle_ruleset, filter_chain, packet, ruleset, verbose, table_name="mangle")
+    
+    # Filter
     res, _ = run_chain(ruleset, filter_chain, packet, ruleset, verbose, table_name="filter")
     
     if res == 'DROP' or res == 'REJECT':
         print(f"Result: {res}")
         return res, None
     
-    # 3. POSTROUTING (SRCNAT)
+    # 3. POSTROUTING
+    # Mangle Postrouting
+    run_chain(mangle_ruleset, 'postrouting', packet, ruleset, verbose, table_name="mangle")
+    
+    # NAT SRCNAT
     if not is_v6 and packet['state'] == 'new' and filter_chain != 'input':
         run_chain(cfg.nat_rules, 'srcnat', packet, cfg.rules, verbose, table_name="nat")
     
