@@ -18,7 +18,7 @@ A Python-based simulator for MikroTik RouterOS firewall configurations (specific
 
 ```bash
 # No external dependencies required (uses standard library)
-git clone <repo-url>
+git clone https://github.com/ffzg/tilera-fw-simulator.git
 cd tilera-fw-simulator
 ```
 
