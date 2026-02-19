@@ -85,6 +85,16 @@ class Rule:
             if packet.get('routing_mark') != self.params['routing-mark']:
                 return False, f"routing-mark {packet.get('routing_mark')} mismatch with {self.params['routing-mark']}"
 
+        if 'src-mac-address' in self.params:
+            spec = self.params['src-mac-address'].split('/')[0]
+            if packet.get('src_mac') != spec:
+                return False, f"src-mac {packet.get('src_mac')} mismatch with {spec}"
+
+        if 'dst-mac-address' in self.params:
+            spec = self.params['dst-mac-address'].split('/')[0]
+            if packet.get('dst_mac') != spec:
+                return False, f"dst-mac {packet.get('dst_mac')} mismatch with {spec}"
+
         if 'tcp-flags' in self.params:
             if packet['proto'] != 'tcp':
                 return False, "tcp-flags on non-TCP protocol"
@@ -246,6 +256,7 @@ class Config:
         self.nat_rules = [] # nat rules (v4)
         self.mangle_rules = [] # mangle rules (v4)
         self.ipv6_mangle_rules = [] # mangle rules (v6)
+        self.bridge_rules = [] # bridge filter rules
         self.address_lists = {} # v4 lists
         self.ipv6_address_lists = {} # v6 lists
         self.interfaces = [] # v4 networks
@@ -366,6 +377,12 @@ class Config:
                 chain = params.get('chain')
                 action = params.get('action', 'accept')
                 self.ipv6_mangle_rules.append(Rule(i + 1, chain, action, params, full_line, self.ipv6_address_lists))
+
+            elif '/interface bridge filter' in full_line:
+                params = parse_params(full_line.split('add ')[1])
+                chain = params.get('chain')
+                action = params.get('action', 'accept')
+                self.bridge_rules.append(Rule(i + 1, chain, action, params, full_line, self.address_lists))
 
     
     def parse_extra_address_list(self, filename):
@@ -527,6 +544,13 @@ def simulate(cfg, conntrack, packet, verbose=False, label="PACKET"):
     print(f"Interfaces: in:{packet['in_interface']} out:{packet['out_interface']}")
     print(f"Chain detected: {filter_chain}")
     
+    # 0. BRIDGE FILTER (Layer 2)
+    if cfg.bridge_rules:
+        res, _ = run_chain(cfg.bridge_rules, filter_chain, packet, ruleset, verbose, table_name="bridge")
+        if res == 'DROP' or res == 'REJECT':
+            print(f"Result: {res} (at bridge layer)")
+            return res, None
+
     conn, direction = conntrack.lookup(packet)
     if conn:
         packet['state'] = 'established'
@@ -605,6 +629,8 @@ if __name__ == "__main__":
     parser.add_argument('--proto', default='udp', help='Protocol (tcp/udp/icmp)')
     parser.add_argument('--dport', type=int, default=161, help='Destination Port (for tcp/udp) or ICMP type (for icmp)')
     parser.add_argument('--sport', type=int, default=12345, help='Source Port (for tcp/udp) or ICMP code (for icmp)')
+    parser.add_argument('--src-mac', default='', help='Source MAC address')
+    parser.add_argument('--dst-mac', default='', help='Destination MAC address')
     parser.add_argument('--in-iface', help='In Interface (auto-detected if omitted)')
     parser.add_argument('--out-iface', help='Out Interface (auto-detected if omitted)')
     parser.add_argument('--tcp-flags', default='', help='TCP flags (e.g. syn,ack)')
@@ -631,7 +657,8 @@ if __name__ == "__main__":
     packet = {
         'src_ip': args.src, 'dst_ip': args.dst,
         'proto': args.proto, 'in_interface': in_iface, 'out_interface': out_iface,
-        'tcp_flags': args.tcp_flags, 'content': args.content, 'size': args.size
+        'tcp_flags': args.tcp_flags, 'content': args.content, 'size': args.size,
+        'src_mac': args.src_mac, 'dst_mac': args.dst_mac
     }
     if args.proto in ['tcp', 'udp']:
         packet['src_port'] = args.sport

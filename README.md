@@ -55,10 +55,10 @@ Supports dual-stack configurations with full IPv6 firewall and Mangle table simu
 - [x] **IPv6 Support**: Full dual-stack simulation.
 - [x] **Mangle Table**: Implementation of `/ip firewall mangle` and routing marks.
 - [x] **Advanced Matchers**: `content`, `tcp-flags`, and `packet-size`.
+- [x] **Layer 2 Simulation**: Basic support for `/interface bridge filter`.
 
 ### Upcoming Tasks
 - [ ] **Interactive Mode**: A "What-If" shell for real-time packet tracing.
-- [ ] **Layer 2 Simulation**: Basic support for `/interface bridge filter`.
 
 ## License
 MIT
