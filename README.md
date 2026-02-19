@@ -40,8 +40,9 @@ python3 verify_simulator.py --limit 500
 
 ## Project Status & Roadmap
 
-### Current Status: **STABLE (IPv4)**
-Verified **100% parity** against the first 500 entries of production `drop.log`.
+### Current Status: **STABLE (IPv4 & IPv6)**
+Verified **100% parity** against the first 500 IPv4 entries of production `drop.log`.
+Supports dual-stack configurations with full IPv6 firewall simulation.
 
 ### Completed Tasks
 - [x] Single-pass RSC configuration parsing.
@@ -50,9 +51,7 @@ Verified **100% parity** against the first 500 entries of production `drop.log`.
 - [x] Automatic Interface/Route lookups.
 - [x] Response testing by default.
 - [x] Untruncated rule output for better debugging.
-
-### Upcoming Tasks
-- [ ] **IPv6 Support**: Parsing and matching for `/ipv6 firewall`.
+- [x] **IPv6 Support**: Parsing and matching for `/ipv6 firewall`.
 - [ ] **Mangle Table**: Implementation of `/ip firewall mangle` and routing marks.
 - [ ] **Advanced Matchers**: `content`, `tcp-flags`, and `packet-size`.
 - [ ] **Interactive Mode**: A "What-If" shell for real-time packet tracing.

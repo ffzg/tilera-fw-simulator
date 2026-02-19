@@ -187,13 +187,18 @@ class Conntrack:
 
 class Config:
     def __init__(self, filename, extra_address_lists=None):
-        self.rules = []  # filter rules
-        self.nat_rules = []
-        self.address_lists = {}
-        self.interfaces = []
+        self.rules = []  # filter rules (v4)
+        self.ipv6_rules = [] # filter rules (v6)
+        self.nat_rules = [] # nat rules (v4)
+        self.address_lists = {} # v4 lists
+        self.ipv6_address_lists = {} # v6 lists
+        self.interfaces = [] # v4 networks
+        self.ipv6_interfaces = [] # v6 networks
         self.interface_ips = {}
         self.local_ips = set()
-        self.routes = []
+        self.ipv6_local_ips = set()
+        self.routes = [] # v4 routes
+        self.ipv6_routes = [] # v6 routes
         self.parse_rsc(filename)
         if extra_address_lists:
             for extra_file in extra_address_lists:
@@ -231,16 +236,36 @@ class Config:
                 if name and addr:
                     self.address_lists.setdefault(name, []).append(addr)
 
+            elif '/ipv6 firewall address-list' in full_line:
+                params = parse_params(full_line.split('add ')[1])
+                name = params.get('list')
+                addr = params.get('address')
+                if name and addr:
+                    self.ipv6_address_lists.setdefault(name, []).append(addr)
+
             elif '/ip address' in full_line:
                 params = parse_params(full_line.split('add ')[1])
                 addr = params.get('address')
-                iface = params.get('interface')
-                if addr and iface:
+                if addr:
                     ip_only = addr.split('/')[0] if '/' in addr else addr
                     self.local_ips.add(ip_only)
-                    self.interface_ips[iface] = ip_only
-                    net = ipaddress.ip_network(addr, strict=False) if '/' in addr else ipaddress.ip_network(addr + "/32", strict=False)
-                    self.interfaces.append((net, iface))
+                    iface = params.get('interface')
+                    if iface:
+                        self.interface_ips[iface] = ip_only
+                        net = ipaddress.ip_network(addr, strict=False) if '/' in addr else ipaddress.ip_network(addr + "/32", strict=False)
+                        self.interfaces.append((net, iface))
+
+            elif '/ipv6 address' in full_line:
+                params = parse_params(full_line.split('add ')[1])
+                addr = params.get('address')
+                if addr:
+                    ip_only = addr.split('/')[0] if '/' in addr else addr
+                    self.ipv6_local_ips.add(ip_only)
+                    iface = params.get('interface')
+                    if iface:
+                        self.interface_ips[iface] = ip_only
+                        net = ipaddress.ip_network(addr, strict=False) if '/' in addr else ipaddress.ip_network(addr + "/128", strict=False)
+                        self.ipv6_interfaces.append((net, iface))
 
             elif '/ip route' in full_line:
                 params = parse_params(full_line.split('add ')[1])
@@ -249,11 +274,24 @@ class Config:
                 if dst and gw:
                     self.routes.append((ipaddress.ip_network(dst, strict=False), gw))
 
+            elif '/ipv6 route' in full_line:
+                params = parse_params(full_line.split('add ')[1])
+                dst = params.get('dst-address', '::/0')
+                gw = params.get('gateway')
+                if dst and gw:
+                    self.ipv6_routes.append((ipaddress.ip_network(dst, strict=False), gw))
+
             elif '/ip firewall filter' in full_line:
                 params = parse_params(full_line.split('add ')[1])
                 chain = params.get('chain')
                 action = params.get('action', 'accept')
                 self.rules.append(Rule(i + 1, chain, action, params, full_line, self.address_lists))
+
+            elif '/ipv6 firewall filter' in full_line:
+                params = parse_params(full_line.split('add ')[1])
+                chain = params.get('chain')
+                action = params.get('action', 'accept')
+                self.ipv6_rules.append(Rule(i + 1, chain, action, params, full_line, self.ipv6_address_lists))
 
             elif '/ip firewall nat' in full_line:
                 params = parse_params(full_line.split('add ')[1])
@@ -279,22 +317,30 @@ class Config:
     
     def get_interface(self, ip_str):
         if not ip_str or ip_str == 'ROUTER_IP': return "unknown"
-        ip = ipaddress.ip_address(ip_str)
-        for net, iface in self.interfaces:
+        try:
+            ip = ipaddress.ip_address(ip_str)
+        except ValueError:
+            return "unknown"
+            
+        is_v6 = ip.version == 6
+        interfaces = self.ipv6_interfaces if is_v6 else self.interfaces
+        routes = self.ipv6_routes if is_v6 else self.routes
+        
+        for net, iface in interfaces:
             if ip in net:
                 return iface
         
         best_match = None
         best_len = -1
-        for net, gw in self.routes:
+        for net, gw in routes:
             if ip in net:
                 if net.prefixlen > best_len:
                     best_match = gw
                     best_len = net.prefixlen
         
         if best_match:
-            if re.match(r'\d+\.\d+\.\d+\.\d+', best_match):
-                return self.get_interface(best_match)  # Recursion, but assume no loops
+            if re.match(r'[0-9a-fA-F:]+', best_match) if is_v6 else re.match(r'\d+\.\d+\.\d+\.\d+', best_match):
+                return self.get_interface(best_match)
             return best_match
             
         return "unknown"
@@ -379,11 +425,15 @@ def simulate(cfg, conntrack, packet, verbose=False, label="PACKET"):
     print(f"\n[{label}]")
     orig_packet = copy.deepcopy(packet)
     
+    is_v6 = ipaddress.ip_address(packet['src_ip']).version == 6
+    local_ips = cfg.ipv6_local_ips if is_v6 else cfg.local_ips
+    ruleset = cfg.ipv6_rules if is_v6 else cfg.rules
+    
     # Determine Chain: INPUT, OUTPUT, or FORWARD
     filter_chain = 'forward'
-    if packet['dst_ip'] in cfg.local_ips:
+    if packet['dst_ip'] in local_ips:
         filter_chain = 'input'
-    elif packet['src_ip'] in cfg.local_ips or packet['src_ip'] == 'ROUTER_IP':
+    elif packet['src_ip'] in local_ips or packet['src_ip'] == 'ROUTER_IP':
         filter_chain = 'output'
     
     print(f"Interfaces: in:{packet['in_interface']} out:{packet['out_interface']}")
@@ -418,11 +468,11 @@ def simulate(cfg, conntrack, packet, verbose=False, label="PACKET"):
         print(f"Flow: {packet['src_ip']}:{packet['src_port']} -> {packet['dst_ip']}:{packet['dst_port']} ({packet['proto']}, {packet['state']})")
     
     # 1. PREROUTING (DSTNAT)
-    if packet['state'] == 'new' and filter_chain != 'output':
+    if not is_v6 and packet['state'] == 'new' and filter_chain != 'output':
         res, _ = run_chain(cfg.nat_rules, 'dstnat', packet, cfg.rules, verbose, table_name="nat")
         if res == 'DST-NAT':
             # Re-check chain after DST-NAT
-            if packet['dst_ip'] in cfg.local_ips:
+            if packet['dst_ip'] in local_ips:
                 filter_chain = 'input'
             else:
                 filter_chain = 'forward'
@@ -430,14 +480,14 @@ def simulate(cfg, conntrack, packet, verbose=False, label="PACKET"):
             print(f"Rerouting after DST-NAT: new chain: {filter_chain}, new out-interface: {packet['out_interface']}")
     
     # 2. FILTERING
-    res, _ = run_chain(cfg.rules, filter_chain, packet, cfg.rules, verbose, table_name="filter")
+    res, _ = run_chain(ruleset, filter_chain, packet, ruleset, verbose, table_name="filter")
     
     if res == 'DROP' or res == 'REJECT':
         print(f"Result: {res}")
         return res, None
     
     # 3. POSTROUTING (SRCNAT)
-    if packet['state'] == 'new' and filter_chain != 'input':
+    if not is_v6 and packet['state'] == 'new' and filter_chain != 'input':
         run_chain(cfg.nat_rules, 'srcnat', packet, cfg.rules, verbose, table_name="nat")
     
     if packet['state'] == 'new' and (res in ['ACCEPT', 'CONTINUE', 'ACCEPT (default)', 'FASTTRACK-CONNECTION']):
@@ -466,7 +516,9 @@ if __name__ == "__main__":
     
     print("\n[ADDRESS LISTS]")
     for name, addrs in sorted(cfg.address_lists.items()):
-        print(f" {name:20} {len(addrs):>5} entries")
+        print(f"  {name:20} (v4) {len(addrs):>5} entries")
+    for name, addrs in sorted(cfg.ipv6_address_lists.items()):
+        print(f"  {name:20} (v6) {len(addrs):>5} entries")
         
     conntrack = Conntrack()
     
